@@ -38,17 +38,17 @@ struct ActiveDanmaku {
 }
 
 fn print_help() {
-    println!("bilidanm - Bilibili Danmaku Visualizer");
+    println!("bilidm - Bilibili Danmaku Visualizer");
     println!();
     println!("USAGE:");
-    println!("    bilidanm <BV_ID | URL>");
+    println!("    bilidm <BV_ID | URL>");
     println!();
     println!("ARGUMENTS:");
     println!("    <BV_ID | URL>    BV ID (e.g., BV1WYXDB7EPm) or full URL containing BV ID");
     println!();
     println!("EXAMPLES:");
-    println!("    bilidanm BV1WYXDB7EPm");
-    println!("    bilidanm https://www.bilibili.com/video/BV1WYXDB7EPm");
+    println!("    bilidm BV1WYXDB7EPm");
+    println!("    bilidm https://www.bilibili.com/video/BV1WYXDB7EPm");
     println!();
     println!("KEYBOARD SHORTCUTS:");
     println!("    q / Esc    Exit the player");
