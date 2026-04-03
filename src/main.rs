@@ -283,12 +283,12 @@ fn run_app(
         .max(1.0);
     let time_offset = pending_danmakus.first().map(|d| d.time).unwrap_or(0.0);
 
-    let tick_rate = Duration::from_millis(16);
+    let tick_rate = Duration::from_millis(8);
     let mut last_tick = Instant::now();
 
     loop {
         let elapsed_sec = start_time.elapsed().as_secs_f32();
-        let virtual_time = (elapsed_sec * 1.2) + time_offset;
+        let virtual_time = elapsed_sec + time_offset;
 
         terminal.draw(|f| {
             let size = f.area();
@@ -303,7 +303,7 @@ fn run_app(
 
             let buf = f.buffer_mut();
             for dm in &active_danmakus {
-                let mut current_x = dm.x.round() as i32;
+                let mut current_x = dm.x as i32;
                 let current_y =
                     danmaku_area.y + (dm.relative_y * danmaku_area.height as f32) as u16;
 
@@ -368,7 +368,7 @@ fn run_app(
                     text: dm_data.text,
                     x: term_width,
                     relative_y: rng.random_range(0.0..1.0),
-                    speed: rng.random_range(15.0..30.0),
+                    speed: rng.random_range(20.0..25.0),
                     color: dm_data.color,
                 });
             }
