@@ -383,6 +383,10 @@ fn run_app(
                 dm.x + (total_width as f32) > 0.0
             });
 
+            if pending_danmakus.is_empty() && active_danmakus.is_empty() {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                return Ok(());
+            }
             last_tick = Instant::now();
         }
     }
