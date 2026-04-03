@@ -5,7 +5,10 @@
 ## 安装
 
 ```bash
+git clone https://github.com/akirco/bilidm
+cd bilidm
 cargo build --release
+mv target/releases/bilidm ~/.local/bin
 ```
 
 ## 使用
