@@ -7,17 +7,22 @@ use rand::RngExt;
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Alignment, Constraint, Direction, Layout},
     style::{Color, Style},
     symbols,
-    widgets::LineGauge,
+    widgets::{LineGauge, Paragraph},
 };
 use regex::Regex;
+use reqwest::{Client, header};
+use rodio::{Decoder, DeviceSinkBuilder, Player};
+use serde::Deserialize;
 use serde_json::Value;
 use std::{
     env,
     error::Error,
+    io::Cursor,
     io::stdout,
+    thread,
     time::{Duration, Instant},
 };
 use unicode_width::UnicodeWidthChar;
@@ -35,6 +40,18 @@ struct ActiveDanmaku {
     relative_y: f32,
     speed: f32,
     color: Color,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SubtitleItem {
+    from: f32,
+    to: f32,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SubtitleFile {
+    body: Vec<SubtitleItem>,
 }
 
 fn print_help() {
@@ -65,7 +82,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let input = &args[1];
     let bvid = extract_bvid(input).ok_or("Failed to find a valid BV ID in the input")?;
 
-    let mut danmakus = fetch_danmaku(&bvid).await?;
+    let (mut danmakus, subtitles, audio_bytes) = fetch_data(&bvid).await?;
     danmakus.sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap());
 
     if danmakus.is_empty() {
@@ -73,13 +90,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
+    thread::spawn(move || {
+        let handle = DeviceSinkBuilder::open_default_sink().unwrap();
+        let player = Player::connect_new(handle.mixer());
+        let cursor = Cursor::new(audio_bytes);
+        let source = Decoder::try_from(cursor).unwrap();
+        player.append(source);
+        player.sleep_until_end();
+    });
+
     enable_raw_mode()?;
     let mut stdout = stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let res = run_app(&mut terminal, danmakus);
+    let res = run_app(&mut terminal, danmakus, subtitles);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -95,57 +121,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
 fn extract_bvid(input: &str) -> Option<String> {
     let re = Regex::new(r"BV[1-9A-HJ-NP-Za-km-z]{10}").unwrap();
     re.find(input).map(|m| m.as_str().to_string())
-}
-
-async fn fetch_danmaku(bvid: &str) -> Result<Vec<DanmakuData>, Box<dyn Error>> {
-    let client = reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-        .build()?;
-
-    let info_url = format!(
-        "https://api.bilibili.com/x/web-interface/view?bvid={}",
-        bvid
-    );
-    let info_resp: Value = client
-        .get(&info_url)
-        .header("Referer", "https://www.bilibili.com/")
-        .send()
-        .await?
-        .json()
-        .await?;
-
-    if info_resp["code"].as_i64().unwrap_or(-1) != 0 {
-        return Err(format!(
-            "Failed to fetch video info: {}",
-            info_resp["message"].as_str().unwrap_or("Unknown error")
-        )
-        .into());
-    }
-
-    let cid = info_resp["data"]["cid"].as_i64().unwrap();
-    let mut danmakus = Vec::new();
-
-    for seg_idx in 1..=2 {
-        let dm_url = format!(
-            "https://api.bilibili.com/x/v2/dm/web/seg.so?type=1&oid={}&segment_index={}",
-            cid, seg_idx
-        );
-        let dm_bytes = client
-            .get(&dm_url)
-            .header("Referer", "https://www.bilibili.com/")
-            .header("Accept", "application/octet-stream")
-            .send()
-            .await?
-            .bytes()
-            .await?;
-
-        if dm_bytes.is_empty() {
-            break;
-        }
-        parse_seg_so(&dm_bytes, &mut danmakus);
-    }
-
-    Ok(danmakus)
 }
 
 fn decode_varint(data: &[u8], offset: &mut usize) -> Option<u64> {
@@ -268,9 +243,302 @@ fn parse_dm_elem(data: &[u8], danmakus: &mut Vec<DanmakuData>) {
     }
 }
 
+fn build_http_client(bvid: &str) -> Result<reqwest::Client, Box<dyn Error>> {
+    let mut headers = header::HeaderMap::new();
+    headers.insert(
+        "authority",
+        header::HeaderValue::from_static("api.bilibili.com"),
+    );
+    headers.insert("accept", header::HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"));
+
+    headers.insert(
+        header::REFERER,
+        format!("https://www.bilibili.com/video/{}", bvid).parse()?,
+    );
+
+    let client = Client::builder()
+        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36")
+        .default_headers(headers)
+        .build()?;
+    Ok(client)
+}
+async fn fetch_danmaku(bvid: &str) -> Result<Vec<DanmakuData>, Box<dyn Error>> {
+    let client = build_http_client(bvid)?;
+
+    let info_url = format!(
+        "https://api.bilibili.com/x/web-interface/view?bvid={}",
+        bvid
+    );
+    let info_resp: Value = client
+        .get(&info_url)
+        .header("Referer", "https://www.bilibili.com/")
+        .send()
+        .await?
+        .json()
+        .await?;
+
+    if info_resp["code"].as_i64().unwrap_or(-1) != 0 {
+        return Err(format!(
+            "Failed to fetch video info: {}",
+            info_resp["message"].as_str().unwrap_or("Unknown error")
+        )
+        .into());
+    }
+
+    let cid = info_resp["data"]["cid"].as_i64().unwrap();
+    let mut danmakus = Vec::new();
+
+    for seg_idx in 1..=2 {
+        let dm_url = format!(
+            "https://api.bilibili.com/x/v2/dm/web/seg.so?type=1&oid={}&segment_index={}",
+            cid, seg_idx
+        );
+        let dm_bytes = client
+            .get(&dm_url)
+            .header("Referer", "https://www.bilibili.com/")
+            .header("Accept", "application/octet-stream")
+            .send()
+            .await?
+            .bytes()
+            .await?;
+
+        if dm_bytes.is_empty() {
+            break;
+        }
+        parse_seg_so(&dm_bytes, &mut danmakus);
+    }
+
+    Ok(danmakus)
+}
+async fn fetch_subtitles(bvid: &str) -> Result<Vec<SubtitleItem>, Box<dyn Error>> {
+    let client = build_http_client(bvid)?;
+
+    let info_url = format!(
+        "https://api.bilibili.com/x/web-interface/view?bvid={}",
+        bvid
+    );
+    let info_resp: Value = client.get(&info_url).send().await?.json().await?;
+
+    if info_resp["code"].as_i64().unwrap_or(-1) != 0 {
+        return Err("Failed to fetch video info".into());
+    }
+
+    let aid = info_resp["data"]["aid"].as_i64().unwrap();
+    let cid = info_resp["data"]["cid"].as_i64().unwrap();
+
+    let player_url = format!(
+        "https://api.bilibili.com/x/player/wbi/v2?aid={}&cid={}",
+        aid, cid
+    );
+
+    let player_resp: Value = client
+        .get(&player_url)
+        .header("Referer", "https://www.bilibili.com/")
+        .header("Cookie", "")
+        .send()
+        .await?
+        .json()
+        .await?;
+
+    let mut subtitle_url = None;
+
+    if player_resp["code"].as_i64().unwrap_or(-1) == 0
+        && let Some(subtitles) = player_resp["data"]["subtitle"]["subtitles"].as_array()
+    {
+        for sub in subtitles {
+            let lan = sub["lan"].as_str().unwrap_or("");
+            let url = sub["subtitle_url"].as_str().unwrap_or("");
+            if !lan.starts_with("ai-") && !url.is_empty() {
+                subtitle_url = Some(url.to_string());
+                break;
+            }
+        }
+
+        if subtitle_url.is_none() {
+            for sub in subtitles {
+                let lan = sub["lan"].as_str().unwrap_or("");
+                let url = sub["subtitle_url"].as_str().unwrap_or("");
+                if lan.starts_with("ai-") && !url.is_empty() {
+                    subtitle_url = Some(url.to_string());
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut parsed_subtitles = Vec::new();
+    if let Some(url) = subtitle_url {
+        let full_url = if url.starts_with("//") {
+            format!("https:{}", url)
+        } else {
+            url
+        };
+
+        if let Ok(sub_json) = client
+            .get(&full_url)
+            .send()
+            .await?
+            .json::<SubtitleFile>()
+            .await
+        {
+            parsed_subtitles = sub_json.body;
+        }
+    }
+
+    Ok(parsed_subtitles)
+}
+
+async fn fetch_audio_data(bvid: &str) -> Result<bytes::Bytes, Box<dyn Error>> {
+    let client = build_http_client(bvid)?;
+    let info_url = format!(
+        "https://api.bilibili.com/x/web-interface/view?bvid={}",
+        bvid
+    );
+    let info_resp: Value = client.get(&info_url).send().await?.json().await?;
+    if info_resp["code"].as_i64().unwrap_or(-1) != 0 {
+        return Err("Failed to fetch video info".into());
+    }
+    let cid = info_resp["data"]["cid"].as_i64().unwrap();
+
+    let playurl_url = format!(
+        "https://api.bilibili.com/x/player/playurl?bvid={}&cid={}&fnval=16",
+        bvid, cid
+    );
+    let play_resp: Value = client
+        .get(&playurl_url)
+        .header("Referer", "https://www.bilibili.com/")
+        .send()
+        .await?
+        .json()
+        .await?;
+
+    let mut audio_bytes = bytes::Bytes::new();
+    if play_resp["code"].as_i64().unwrap_or(-1) == 0 {
+        if let Some(audio_arr) = play_resp["data"]["dash"]["audio"].as_array() {
+            let mut audios = audio_arr.to_vec();
+            audios.sort_by_key(|a| a["id"].as_i64().unwrap_or(0));
+            audios.reverse();
+
+            if let Some(best_audio) = audios.first()
+                && let Some(audio_url) = best_audio["baseUrl"]
+                    .as_str()
+                    .or_else(|| best_audio["base_url"].as_str())
+            {
+                let audio_res = client.get(audio_url).send().await?;
+
+                if audio_res.status().is_success() {
+                    audio_bytes = audio_res.bytes().await?;
+                } else {
+                    eprintln!(
+                        "警告：下载音频流失败，CDN 返回状态码 {}",
+                        audio_res.status()
+                    );
+                }
+            }
+        }
+    } else {
+        eprintln!(
+            "警告：获取 playurl 失败: {}",
+            play_resp["message"].as_str().unwrap_or("")
+        );
+    }
+    Ok(audio_bytes)
+}
+
+// pub async fn fetch_audio_data(bvid: &str) -> Result<Bytes, Box<dyn Error>> {
+//     let client = build_http_client(bvid)?;
+
+//     let mut headers = header::HeaderMap::new();
+
+//     headers.insert(
+//         header::REFERER,
+//         format!("https://www.bilibili.com/video/{}", bvid).parse()?,
+//     );
+
+//     let view_url = format!(
+//         "https://api.bilibili.com/x/web-interface/view?bvid={}",
+//         bvid
+//     );
+
+//     let resp: Response = client
+//         .get(&view_url)
+//         .headers(headers.clone())
+//         .send()
+//         .await?;
+
+//     if !resp.status().is_success() {
+//         return Err(format!("获取视频信息失败: HTTP {}", resp.status()).into());
+//     }
+
+//     let body = resp.text().await?;
+//     let json: Value = serde_json::from_str(&body)?;
+
+//     let data = json.get("data").ok_or("API 返回数据无效: data 字段缺失")?;
+
+//     let cid = data
+//         .get("pages")
+//         .and_then(|p| p.get(0))
+//         .and_then(|p| p.get("cid"))
+//         .and_then(|c| c.as_i64())
+//         .ok_or("无法解析 CID")?;
+
+//     let play_url = format!(
+//         "http://api.bilibili.com/x/player/wbi/playurl?fnval=16&bvid={}&cid={}",
+//         bvid, cid
+//     );
+
+//     let resp: Response = client
+//         .get(&play_url)
+//         .headers(headers.clone())
+//         .send()
+//         .await?;
+
+//     if !resp.status().is_success() {
+//         return Err(format!("获取播放地址失败: HTTP {}", resp.status()).into());
+//     }
+
+//     let body = resp.text().await?;
+//     let json: Value = serde_json::from_str(&body)?;
+
+//     let audio_list = json
+//         .get("data")
+//         .and_then(|d| d.get("dash"))
+//         .and_then(|d| d.get("audio"))
+//         .and_then(|a| a.as_array())
+//         .ok_or("音频字段为空或格式错误")?;
+
+//     if audio_list.is_empty() {
+//         return Err("未找到音频流".into());
+//     }
+
+//     let base_url = audio_list[0]
+//         .get("baseUrl")
+//         .and_then(|u| u.as_str())
+//         .ok_or("无法解析音频 BaseUrl")?;
+
+//     let audio_resp: Response = client.get(base_url).headers(headers).send().await?;
+
+//     if !audio_resp.status().is_success() {
+//         return Err(format!("音频下载失败: HTTP {}", audio_resp.status()).into());
+//     }
+
+//     let bytes = audio_resp.bytes().await?;
+
+//     Ok(bytes)
+// }
+
+async fn fetch_data(
+    bvid: &str,
+) -> Result<(Vec<DanmakuData>, Vec<SubtitleItem>, bytes::Bytes), Box<dyn Error>> {
+    let danmakus = fetch_danmaku(bvid).await?;
+    let subtitles = fetch_subtitles(bvid).await?;
+    let audio_bytes = fetch_audio_data(bvid).await?;
+    Ok((danmakus, subtitles, audio_bytes))
+}
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     mut pending_danmakus: Vec<DanmakuData>,
+    subtitles: Vec<SubtitleItem>,
 ) -> Result<(), Box<dyn Error>> {
     let mut active_danmakus: Vec<ActiveDanmaku> = Vec::new();
     let start_time = Instant::now();
@@ -295,11 +563,16 @@ fn run_app(
 
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Min(0), Constraint::Length(1)])
+                .constraints([
+                    Constraint::Min(0),    //弹幕
+                    Constraint::Length(1), //字幕
+                    Constraint::Length(1), //进度条
+                ])
                 .split(size);
 
             let danmaku_area = chunks[0];
-            let progress_area = chunks[1];
+            let subtitle_area = chunks[1];
+            let progress_area = chunks[2];
 
             let buf = f.buffer_mut();
             for dm in &active_danmakus {
@@ -337,6 +610,18 @@ fn run_app(
                 total_secs / 60,
                 total_secs % 60
             );
+
+            let current_sub = subtitles
+                .iter()
+                .find(|s| virtual_time >= s.from && virtual_time <= s.to);
+
+            if let Some(sub) = current_sub {
+                let paragraph = Paragraph::new(sub.content.as_str())
+                    .style(Style::default().fg(Color::LightGreen)) // 稍微给个暗背景突出字幕
+                    .alignment(Alignment::Center);
+
+                f.render_widget(paragraph, subtitle_area);
+            }
 
             let bilibili_pink = Color::Rgb(251, 113, 152);
             let gauge = LineGauge::default()
